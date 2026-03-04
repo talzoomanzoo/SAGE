@@ -90,6 +90,48 @@ from verl.workers.rollout.vllm_rollout.utils import (
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# vLLM expects `tokenizer.all_special_tokens_extended` (newer transformers).
+# Some tokenizers (e.g. Qwen2Tokenizer on older transformers) don't have it.
+def _ensure_transformers_tokenizer_compat() -> None:
+    try:
+        from transformers import PreTrainedTokenizerBase
+    except Exception:
+        return
+
+    if hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):
+        return
+
+    def _all_special_tokens_extended(self) -> list[str]:
+        # Prefer extended map if present; otherwise fall back to all_special_tokens.
+        try:
+            m = getattr(self, "special_tokens_map_extended", None)
+            if m:
+                vals: list[str] = []
+                for v in m.values():
+                    if v is None:
+                        continue
+                    if isinstance(v, (list, tuple, set)):
+                        vals.extend([str(x) for x in v])
+                    else:
+                        vals.append(str(v))
+                if vals:
+                    seen = set()
+                    out: list[str] = []
+                    for t in vals:
+                        if t not in seen:
+                            out.append(t)
+                            seen.add(t)
+                    return out
+        except Exception:
+            pass
+        try:
+            return [str(x) for x in getattr(self, "all_special_tokens", [])]
+        except Exception:
+            return []
+
+    PreTrainedTokenizerBase.all_special_tokens_extended = property(_all_special_tokens_extended)  # type: ignore[attr-defined]
+
+
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -215,6 +257,8 @@ class vLLMRollout(BaseRollout):
                 compilation_config["compilation_config"] = CompilationConfig(**compilation_args)
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
+
+        _ensure_transformers_tokenizer_compat()
 
         self.inference_engine = LLM(
             model=model_path,

@@ -321,20 +321,24 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
                     auto_model_cls = AutoModelForCausalLM
                 elif "ForConditionalGeneration" in model_config.architectures[0]:
-                    # Handle different transformers versions for Vision2Seq models
-                    import transformers
-                    from packaging import version
-
-                    if version.parse(transformers.__version__) >= version.parse("4.54.0"):
-                        # transformers >= 4.54.0 uses AutoModelForImageTextToText
-                        from transformers import AutoModelForImageTextToText
+                    # Try both variants across transformers versions.
+                    auto_model_cls = None
+                    try:
+                        from transformers import AutoModelForImageTextToText  # type: ignore
 
                         auto_model_cls = AutoModelForImageTextToText
-                    else:
-                        # transformers < 4.54.0 uses AutoModelForVision2Seq
-                        from transformers import AutoModelForVision2Seq
+                    except Exception:
+                        pass
+                    if auto_model_cls is None:
+                        try:
+                            from transformers import AutoModelForVision2Seq  # type: ignore
 
-                        auto_model_cls = AutoModelForVision2Seq
+                            auto_model_cls = AutoModelForVision2Seq
+                        except Exception as e:
+                            raise RuntimeError(
+                                "ForConditionalGeneration model detected, but this transformers version "
+                                "does not provide AutoModelForImageTextToText or AutoModelForVision2Seq."
+                            ) from e
                 else:
                     raise NotImplementedError(f"Unknown architecture {model_config['architectures']}")
 

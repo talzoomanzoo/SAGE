@@ -20,7 +20,6 @@ from types import SimpleNamespace
 from typing import Optional
 
 import torch
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.modeling_utils import PreTrainedModel
 
 from verl.utils.import_utils import is_trl_available
@@ -32,6 +31,22 @@ from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_world_size,
     slice_input_tensor,
 )
+
+
+def _get_flash_attention_forward():
+    """
+    Import FlashAttention helper lazily.
+
+    In some environments, `flash_attn` may be installed but ABI-broken, and importing
+    `transformers.modeling_flash_attention_utils` will crash. We must keep module import safe
+    so training can fall back to SDPA/eager attention.
+    """
+    try:
+        from transformers.modeling_flash_attention_utils import _flash_attention_forward  # type: ignore
+
+        return _flash_attention_forward
+    except Exception:
+        return None
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -105,7 +120,14 @@ def _ulysses_flash_attention_forward(
 
     # (bsz, seq_len, n_head/n, head_dim)
     query_length = query_states.size(1)
-    attn_output = _flash_attention_forward(
+    flash_attn_forward = _get_flash_attention_forward()
+    if flash_attn_forward is None:
+        raise RuntimeError(
+            "FlashAttention forward is unavailable (flash_attn not installed or failed to import). "
+            "Disable flash attention or install a compatible flash_attn build."
+        )
+
+    attn_output = flash_attn_forward(
         query_states, key_states, value_states, attention_mask, query_length, *args, position_ids=position_ids, **kwargs
     )
 
@@ -413,7 +435,14 @@ def apply_monkey_patch(
         return
 
     if use_remove_padding or ulysses_sp_size > 1:
-        if hasattr(module, "_flash_attention_forward"):  # transformers <= 4.47.1 or legacy models
+        # If flash-attn is missing or broken (ABI mismatch), importing transformers flash-attn helpers
+        # will crash. In that case, we skip patching flash attention and let models fall back to SDPA/eager.
+        if _get_flash_attention_forward() is None:
+            print(
+                "Skipping flash-attn monkey patch (flash_attn not available or failed to import). "
+                "Falling back to SDPA/eager attention."
+            )
+        elif hasattr(module, "_flash_attention_forward"):  # transformers <= 4.47.1 or legacy models
             module._flash_attention_forward = _ulysses_flash_attention_forward
             print(f"Monkey patch _flash_attention_forward in {model.__module__}")
         else:

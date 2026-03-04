@@ -31,7 +31,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoModelForTokenClassification,
-    AutoModelForVision2Seq,
     GenerationConfig,
     MistralForSequenceClassification,
     PretrainedConfig,
@@ -41,6 +40,33 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from verl.models.registry import ModelRegistry
 from verl.utils.import_utils import is_trl_available
+
+try:
+    # Optional for older transformers versions (text-only training doesn’t need it).
+    from transformers import AutoModelForVision2Seq  # type: ignore
+except Exception:  # pragma: no cover
+    AutoModelForVision2Seq = None  # type: ignore[assignment]
+
+
+def _select_attn_implementation(prefer_flash_attention_2: bool = True) -> str:
+    """
+    Transformers models may hard-fail if `attn_implementation="flash_attention_2"` is set but `flash_attn`
+    isn't importable/installed. Select the best available backend at runtime.
+    """
+    if prefer_flash_attention_2:
+        try:
+            import flash_attn  # noqa: F401
+
+            return "flash_attention_2"
+        except Exception:
+            pass
+    # Prefer SDPA when available; otherwise fall back to eager attention.
+    try:
+        from torch.nn.functional import scaled_dot_product_attention  # noqa: F401
+
+        return "sdpa"
+    except Exception:
+        return "eager"
 
 
 class LambdaLayer(nn.Module):
@@ -617,14 +643,14 @@ def patch_valuehead_model(model) -> None:
 
 
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
-    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
+    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification
 
     try:
         model = AutoModelForTokenClassification.from_pretrained(
             pretrained_model_name_or_path=local_path,
             torch_dtype=torch_dtype,
             config=model_config,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_select_attn_implementation(),
             trust_remote_code=trust_remote_code,
         )
         return model
@@ -638,7 +664,7 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
 
     from trl import AutoModelForCausalLMWithValueHead
 
-    if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
+    if AutoModelForVision2Seq is not None and type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
         module_class = AutoModelForVision2Seq
     else:
         module_class = AutoModelForCausalLM
@@ -646,7 +672,7 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
         pretrained_model_name_or_path=local_path,
         torch_dtype=torch_dtype,
         config=model_config,
-        attn_implementation="flash_attention_2",
+        attn_implementation=_select_attn_implementation(),
         trust_remote_code=trust_remote_code,
     )
     model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
@@ -656,10 +682,12 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
 
 _architecture_to_auto_class = {
     "ForCausalLM": AutoModelForCausalLM,
-    "ForVision2Seq": AutoModelForVision2Seq,
     "ForTokenClassification": AutoModelForTokenClassification,
     "ForSequenceClassification": AutoModelForSequenceClassification,
 }
+
+if AutoModelForVision2Seq is not None:
+    _architecture_to_auto_class["ForVision2Seq"] = AutoModelForVision2Seq
 
 
 def get_hf_auto_model_class(hf_config):
@@ -670,6 +698,11 @@ def get_hf_auto_model_class(hf_config):
         auto_class = next(k for k, v in hf_config.auto_map.items() if hf_config.architectures[0] in v)
         match auto_class:
             case "AutoModelForVision2Seq":
+                if AutoModelForVision2Seq is None:
+                    raise RuntimeError(
+                        "This transformers version does not provide AutoModelForVision2Seq. "
+                        "Upgrade transformers or use a text-only model."
+                    )
                 actor_module_class = AutoModelForVision2Seq
             case "AutoModelForCausalLM":
                 actor_module_class = AutoModelForCausalLM

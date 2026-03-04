@@ -24,11 +24,15 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoModelForTokenClassification,
-    AutoModelForVision2Seq,
     GenerationConfig,
 )
 
 from verl.utils import hf_processor, hf_tokenizer
+
+try:
+    from transformers import AutoModelForVision2Seq  # type: ignore
+except Exception:  # pragma: no cover
+    AutoModelForVision2Seq = None  # type: ignore[assignment]
 
 
 def parse_args():

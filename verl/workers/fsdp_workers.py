@@ -96,6 +96,44 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _select_attn_implementation(prefer_flash_attention_2: bool = True) -> str:
+    """
+    Select a Transformers attention backend that is actually usable at runtime.
+
+    In this environment `flash_attn` may be installed but ABI-broken; attempting to use
+    `flash_attention_2` will crash during model init. We therefore only use it when a real
+    `import flash_attn` succeeds.
+    """
+    if prefer_flash_attention_2:
+        try:
+            import flash_attn  # noqa: F401
+
+            return "flash_attention_2"
+        except Exception:
+            pass
+    try:
+        from torch.nn.functional import scaled_dot_product_attention  # noqa: F401
+
+        return "sdpa"
+    except Exception:
+        return "eager"
+
+
+def _force_transformers_attn_implementation(cfg, attn_impl: str) -> None:
+    """
+    Ensure Transformers does not try to auto-enable FlashAttention during model init.
+    """
+    for attr in ("attn_implementation", "_attn_implementation", "_attn_implementation_internal"):
+        try:
+            setattr(cfg, attr, attn_impl)
+        except Exception:
+            pass
+    for sub_attr in ("text_config", "vision_config", "llm_config"):
+        sub = getattr(cfg, sub_attr, None)
+        if sub is not None:
+            _force_transformers_attn_implementation(sub, attn_impl)
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -281,13 +319,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         enable_activation_offload=False,
     ):
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import (
-            AutoConfig,
-            AutoModel,
-            AutoModelForCausalLM,
-            AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
-        )
+        from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+
+        try:
+            from transformers import AutoModelForImageTextToText  # type: ignore
+        except Exception:  # pragma: no cover
+            AutoModelForImageTextToText = None  # type: ignore[assignment]
+
+        try:
+            from transformers import AutoModelForVision2Seq  # type: ignore
+        except Exception:  # pragma: no cover
+            AutoModelForVision2Seq = None  # type: ignore[assignment]
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -315,8 +357,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
+        attn_impl = _select_attn_implementation()
         actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
+            local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_impl
         )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
@@ -337,6 +380,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         }
         override_config_kwargs.update(override_model_config)
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
+        _force_transformers_attn_implementation(actor_model_config, attn_impl)
         if self.rank == 0:
             print(f"Model config after override: {actor_model_config}")
 
@@ -356,19 +400,35 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 )
                 match auto_class:
                     case "AutoModelForVision2Seq":
+                        if AutoModelForVision2Seq is None:
+                            raise RuntimeError(
+                                "This transformers version does not provide AutoModelForVision2Seq. "
+                                "Upgrade transformers or use a text-only model."
+                            )
                         actor_module_class = AutoModelForVision2Seq
                     case "AutoModelForCausalLM":
                         actor_module_class = AutoModelForCausalLM
                     case "AutoModelForImageTextToText":
+                        if AutoModelForImageTextToText is None:
+                            raise RuntimeError(
+                                "This transformers version does not provide AutoModelForImageTextToText. "
+                                "Upgrade transformers or use a text-only model."
+                            )
                         actor_module_class = AutoModelForImageTextToText
                     case _:
                         actor_module_class = AutoModel
             else:
-                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+                if (
+                    AutoModelForVision2Seq is not None
+                    and type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys()
+                ):
                     actor_module_class = AutoModelForVision2Seq
                 elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
                     actor_module_class = AutoModelForCausalLM
-                elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
+                elif (
+                    AutoModelForImageTextToText is not None
+                    and type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys()
+                ):
                     actor_module_class = AutoModelForImageTextToText
                 else:
                     actor_module_class = AutoModel
@@ -1249,11 +1309,13 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         from transformers import AutoConfig
 
+        critic_attn_impl = _select_attn_implementation()
         critic_model_config = AutoConfig.from_pretrained(
             local_path,
-            attn_implementation="flash_attention_2",
+            attn_implementation=critic_attn_impl,
             trust_remote_code=config.model.get("trust_remote_code", False),
         )
+        _force_transformers_attn_implementation(critic_model_config, critic_attn_impl)
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
         # Maybe support Ulysses in VisionAttention in the future and remove this patch
@@ -1665,7 +1727,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
+                attn_implementation=_select_attn_implementation(),
                 trust_remote_code=trust_remote_code,
             )
 
