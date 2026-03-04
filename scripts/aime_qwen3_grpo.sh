@@ -142,6 +142,7 @@ export RAY_LOG_TO_STDERR=1
 
 python3 -m verl.trainer.main_ppo \
   algorithm.adv_estimator=grpo \
+  trainer.resume_mode=disable \
   +ray_kwargs.ray_init.include_dashboard=False \
   \
   data.train_files="$TRAIN_FILES" \

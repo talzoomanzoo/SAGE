@@ -25,7 +25,6 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
     from verl.utils.device import is_cuda_available, is_npu_available
 
     global _index_first_axis, _pad_input, _rearrange, _unpad_input
-
     if _index_first_axis is not None:
         return _index_first_axis, _pad_input, _rearrange, _unpad_input
 
